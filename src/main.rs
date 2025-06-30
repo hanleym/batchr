@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use crate::parse::Statement;
 
-const BATCH_TARGET_BYTES: usize = 1000000;
+const BATCH_TARGET_BYTES: usize = 8000000;
 
 #[derive(Debug, Clone)]
 enum Section {
@@ -213,14 +213,6 @@ impl DB {
         }
 
         if !errors.is_empty() {
-            let dump = std::fs::File::create("data/dump.json")?;
-            serde_json::to_writer_pretty(&dump, &DumpFile{
-                errors: errors.clone(),
-                queries: batch.clone(),
-            })?;
-            dump.sync_all()?;
-            drop(dump);
-
             let index = errors.iter().enumerate().find_map(|(i, error)| {
                 if !error.contains("not executed due to a failed transaction") {
                     return Some(i);
