@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
 
     let bars = Arc::new(Mutex::new(MultiProgress::new()));
     let style = ProgressStyle::with_template(
-        "{msg}\n⤷[{elapsed_precise}] [{wide_bar}] {human_pos}/{human_len} [{eta_precise}]",
+        "{msg}\n  [{elapsed_precise}] [{wide_bar}] {human_pos}/{human_len} [{eta_precise}]",
     )?
         .progress_chars("##-");
 
