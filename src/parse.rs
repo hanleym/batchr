@@ -1,4 +1,6 @@
-use std::io::{self, BufRead, BufReader, Read};
+use tokio::io::{
+    self, AsyncBufReadExt, AsyncRead, AsyncSeek, AsyncSeekExt, BufReader,
+};
 
 #[derive(Debug)]
 pub enum Statement {
@@ -6,52 +8,72 @@ pub enum Statement {
     Query(String),
 }
 
-pub struct StatementStream<R: Read> {
+/// Streams `Statement`s out of any `AsyncRead + AsyncSeek` source.
+///
+/// * Lines that begin with `--` are comments (newline **excluded**).
+/// * Everything else is part of a query until the first `;\n` terminator
+///   (terminator **included**).
+///
+/// Each `next_statement()` returns the byte offset **from the start of the
+/// file/stream** where that statement begins.
+pub struct StatementStream<R>
+where
+    R: AsyncRead + AsyncSeek + Unpin,
+{
     reader: BufReader<R>,
-    /// Accumulates the current query until we see a terminating “;\n”.
     pending: String,
-    /// Scratch buffer reused for each `read_until`.
     buf: Vec<u8>,
+    stmt_start_pos: Option<u64>,
 }
 
-impl<R: Read> StatementStream<R> {
-    /// 16 KiB is large enough that the kernel almost always completes each
-    /// `read(2)` in a single syscall but small enough to stay CPU-cache-friendly.
+impl<R> StatementStream<R>
+where
+    R: AsyncRead + AsyncSeek + Unpin,
+{
+    /// 16 KiB is small-cache-friendly but usually completed in one read(2).
     pub fn new(inner: R) -> Self {
         Self {
             reader: BufReader::with_capacity(16 * 1024, inner),
             pending: String::new(),
             buf: Vec::with_capacity(1024),
+            stmt_start_pos: None,
         }
     }
 
-    /// Retrieve the underlying reader once you’re done parsing.
+    /// Retrieve the underlying reader when you’re done.
     pub fn into_inner(self) -> R {
         self.reader.into_inner()
     }
 
-    /// Returns the next `Statement`, or `None` at EOF.
+    /// Async counterpart of the synchronous version.
     ///
-    /// * A comment starts with “--” and extends to the newline (the newline is **not**
-    ///   included in the returned string, matching typical SQL comment semantics).
-    /// * A query is everything from its first non-comment line up to and **including**
-    ///   the first “;\n”.
-    pub fn next_statement(&mut self) -> Option<Result<Statement, io::Error>> {
+    /// Returns `None` at clean EOF.
+    pub async fn next_statement(
+        &mut self,
+    ) -> Option<Result<(u64, Statement), io::Error>> {
         loop {
             self.buf.clear();
 
-            // Read one (possibly very long) line, including the '\n'.
-            let n = match self.reader.read_until(b'\n', &mut self.buf) {
-                Ok(0) if self.pending.is_empty() => return None,                    // clean EOF
-                Ok(0) /* EOF in the middle of a query */ => {
+            // Position before we read this line
+            let pos_before_line = match self.reader.stream_position().await {
+                Ok(p) => p,
+                Err(e) => return Some(Err(e)),
+            };
+
+            // Read a line (including `\n`)
+            let n = match self.reader.read_until(b'\n', &mut self.buf).await {
+                Ok(0) if self.pending.is_empty() => return None, // clean EOF
+                Ok(0) => {
+                    // EOF mid-query ⇒ return what we have
                     let q = std::mem::take(&mut self.pending);
-                    return Some(Ok(Statement::Query(q)));
+                    let start = self.stmt_start_pos.take().unwrap_or(0);
+                    return Some(Ok((start, Statement::Query(q))));
                 }
                 Ok(n) => n,
                 Err(e) => return Some(Err(e)),
             };
 
-            // Convert the read bytes to UTF-8; if it’s not valid, propagate an error.
+            // Validate UTF-8
             let line = match std::str::from_utf8(&self.buf[..n]) {
                 Ok(s) => s,
                 Err(_) => {
@@ -62,22 +84,27 @@ impl<R: Read> StatementStream<R> {
                 }
             };
 
-            // Fast path: comment line.
+            // Comment fast-path
             if line.starts_with("--") {
-                debug_assert!(self.pending.is_empty(),
-                              "input mixes comment lines inside statements, which the spec forbids");
-                // Strip the trailing newline if present.
+                debug_assert!(
+                    self.pending.is_empty(),
+                    "comments inside statements are forbidden by spec"
+                );
                 let comment = line.trim_end_matches('\n').to_owned();
-                return Some(Ok(Statement::Comment(comment)));
+                return Some(Ok((pos_before_line, Statement::Comment(comment))));
             }
 
-            // Otherwise we’re in (or starting) a query.
+            // Otherwise we’re building (or starting) a query
+            if self.pending.is_empty() {
+                self.stmt_start_pos = Some(pos_before_line);
+            }
             self.pending.push_str(line);
 
-            // We’ve finished a query when the accumulator ends with “;\n”.
+            // Query complete?
             if self.pending.ends_with(";\n") {
                 let q = std::mem::take(&mut self.pending);
-                return Some(Ok(Statement::Query(q)));
+                let start = self.stmt_start_pos.take().unwrap_or(pos_before_line);
+                return Some(Ok((start, Statement::Query(q))));
             }
         }
     }
