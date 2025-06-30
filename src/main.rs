@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use crate::parse::Statement;
 
-const BATCH_TARGET_BYTES: usize = 8000000;
+const BATCH_TARGET_BYTES: usize = 4000000;
 
 #[derive(Debug, Clone)]
 enum Section {
